@@ -207,6 +207,10 @@ ngx_slab_alloc_locked(ngx_slab_pool_t *pool, size_t size)
 
     if (size > pool->min_size) {
         shift = 1;
+        /*
+         * s = 2^n                 => shift = n
+         * s = 2^n + k < 2^(n + 1) => shift = n
+         */
         for (s = size - 1; s >>= 1; shift++) { /* void */ }
         slot = shift - pool->min_shift;
 
@@ -229,25 +233,52 @@ ngx_slab_alloc_locked(ngx_slab_pool_t *pool, size_t size)
 
             bitmap = (uintptr_t *) ngx_slab_page_addr(pool, page);
 
+            /*
+             * ngx_pagesize >> shift:
+             *   ngx_pagesize / 2^shift
+             * 即 4096 的页里能放下几个大小为 2^shift 字节的块
+             *
+             * map 表示需要几个 bitmap(uintptr_t) 才能表示 page 内所有的块
+             */
             map = (ngx_pagesize >> shift) / (8 * sizeof(uintptr_t));
 
             for (n = 0; n < map; n++) {
 
+                /*
+                 * 筛选出没在用的块
+                 */
                 if (bitmap[n] != NGX_SLAB_BUSY) {
 
                     for (m = 1, i = 0; m; m <<= 1, i++) {
+                        /*
+                         * 找到块里空闲的位置
+                         */
                         if (bitmap[n] & m) {
                             continue;
                         }
 
+                        /*
+                         * 标记已占用，bitmap[n] 每一位代表 (4096/map)byte 块
+                         * 如果 shift = 5，则 map = 128， 4096/map = 32
+                         */
                         bitmap[n] |= m;
 
+                        /*
+                         * bitmap[n] 里第 i 位对应的块的偏移量
+                         * 2^shift = bitmap[n] 里每位对应的块大小
+                         */
                         i = (n * 8 * sizeof(uintptr_t) + i) << shift;
 
+                        /*
+                         * p 指向相应的块
+                         */
                         p = (uintptr_t) bitmap + i;
 
                         pool->stats[slot].used++;
 
+                        /*
+                         * 上面的操作完成后，bitmap[n] 映射的块集合全用了
+                         */
                         if (bitmap[n] == NGX_SLAB_BUSY) {
                             for (n = n + 1; n < map; n++) {
                                 if (bitmap[n] != NGX_SLAB_BUSY) {
@@ -255,7 +286,14 @@ ngx_slab_alloc_locked(ngx_slab_pool_t *pool, size_t size)
                                 }
                             }
 
+                            /*
+                             * page 地址都是对齐的，所以 prev 指向的 page
+                             * 地址最后 n (n > 2) 位都是 0
+                             */
                             prev = ngx_slab_page_prev(page);
+                            /*
+                             * page 满了，所以将 page 从链表里摘除
+                             */
                             prev->next = page->next;
                             page->next->prev = page->prev;
 
@@ -268,7 +306,7 @@ ngx_slab_alloc_locked(ngx_slab_pool_t *pool, size_t size)
                 }
             }
 
-        } else if (shift == ngx_slab_exact_shift) {
+        } else if (shift == ngx_slab_exact_shift /* = 6*/) {
 
             for (m = 1, i = 0; m; m <<= 1, i++) {
                 if (page->slab & m) {
@@ -295,7 +333,24 @@ ngx_slab_alloc_locked(ngx_slab_pool_t *pool, size_t size)
 
         } else { /* shift > ngx_slab_exact_shift */
 
+            /*
+             * ngx_pagesize = 4096
+             * 设 k = ngx_pagesize >> shift 表示 4096 里有多少个 (2^shift)byte 块，
+             * 则 (1 << k) = 2^k 表示 bitmap 的大小，
+             * 2^k - 1 得到 k 个 1。
+             *
+             * 例子：
+             *  shift = 9, chunk_size = 2^9 = 512
+             *  ngx_pagesize = 2^12 = 4096
+             *  k = 4096 >> 9 = 8, 1 << k = 256
+             *  bin(256) = 0b1_0000_0000
+             *  bin(255) = 0b0_1111_1111
+             */
             mask = ((uintptr_t) 1 << (ngx_pagesize >> shift)) - 1;
+            /*
+             * 将 mask 低 32 为移到高 32 位，
+             * 用高 32 位作为 bitmap
+             */
             mask <<= NGX_SLAB_MAP_SHIFT;
 
             for (m = (uintptr_t) 1 << NGX_SLAB_MAP_SHIFT, i = 0;
@@ -335,6 +390,15 @@ ngx_slab_alloc_locked(ngx_slab_pool_t *pool, size_t size)
         if (shift < ngx_slab_exact_shift) {
             bitmap = (uintptr_t *) ngx_slab_page_addr(pool, page);
 
+            /*
+             * 1 << shift: page 内每个块有 2^page 个字节
+             * k = 2^shift
+             * 4096 / (8 * k * k)
+             *
+             * shift = 4, 1 << shift = 16
+             * ngx_pagesize >> shift = 256
+             * n = 256 / (16 * 8) = 2
+             */
             n = (ngx_pagesize >> shift) / ((1 << shift) * 8);
 
             if (n == 0) {
@@ -474,6 +538,11 @@ ngx_slab_free_locked(ngx_slab_pool_t *pool, void *p)
 
     n = ((u_char *) p - pool->start) >> ngx_pagesize_shift;
     page = &pool->pages[n];
+    /*
+     * ngx_slab_alloc_locked:
+     *   if (page)
+     *     page->slab = shift
+     */
     slab = page->slab;
     type = ngx_slab_page_type(page);
 
@@ -488,8 +557,30 @@ ngx_slab_free_locked(ngx_slab_pool_t *pool, void *p)
             goto wrong_chunk;
         }
 
+        /*
+         * ngx_pagesize = 4k = 2^12
+         *
+         * p 指向 page 内的块，所以:
+         *   p & (ngx_pagesize - 1)
+         * 表示 p 指向的块在 page 内的偏移。
+         *
+         * 使 k = p & (ngx_pagesize - 1)，则 k >> shift = k / 2^shift，
+         * 显然，n 表示 p 是 page 内第 n 个块，每个块大小为 2^shift byte
+         */
         n = ((uintptr_t) p & (ngx_pagesize - 1)) >> shift;
+        /*
+         * k = n % (8 * sizeof(uintptr_t))：
+         *   计算出第 n 个块在 bitmap(uintptr_t) 中是第几位
+         *
+         * m = 2^k = 0b10...0 (k 个 0)
+         * 在下面代码里 bitmap[n] & m：
+         *   可以得出 bitmap[n] 里第 m 位是 0 还是 1
+         */
         m = (uintptr_t) 1 << (n % (8 * sizeof(uintptr_t)));
+        /*
+         * n = n / sizeof(bitmap)：
+         *   块 n 是用第几个 bitmap 表示的
+         */
         n /= 8 * sizeof(uintptr_t);
         bitmap = (uintptr_t *)
                              ((uintptr_t) p & ~((uintptr_t) ngx_pagesize - 1));
@@ -684,17 +775,31 @@ ngx_slab_alloc_pages(ngx_slab_pool_t *pool, ngx_uint_t pages)
         if (page->slab >= pages) {
 
             if (page->slab > pages) {
+                /*
+                 * pages 是双向循环链表，此处将最后一个 page 的 prev
+                 * 指向最新待分配的 page 的下一个未分配的 page
+                 */
                 page[page->slab - 1].prev = (uintptr_t) &page[pages];
 
                 page[pages].slab = page->slab - pages;
                 page[pages].next = page->next;
                 page[pages].prev = page->prev;
 
+                /*
+                 * p 指向 pool->free 首地址
+                 * pool->free->prev(page->next->prev) 指向当前空闲链表中的第一个空闲页
+                 */
                 p = (ngx_slab_page_t *) page->prev;
                 p->next = &page[pages];
                 page->next->prev = (uintptr_t) &page[pages];
 
             } else {
+                /*
+                 * p:          pool->free 首地址
+                 * page->next: pool->free 首地址
+                 *
+                 * 将 pool->free 的 next 和 prev 都指向 pool->free
+                 */
                 p = (ngx_slab_page_t *) page->prev;
                 p->next = page->next;
                 page->next->prev = page->prev;
